@@ -28,8 +28,7 @@
         switch (msg.event) {
           case "fronts_snapshot":
             currentFronts = msg.fronts || [];
-            primaryAlterId =
-              currentFronts.find(f => f.primary)?.alter?.id ?? null;
+            primaryAlterId = currentFronts.find(f => f.primary)?.alter?.id ?? null;
             updateFronts();
             break;
 
@@ -99,7 +98,9 @@
         const alter = f.alter;
         if (!alter) return null;
 
-        let name = `<span style="color:${alter.color};">${alter.name}</span>`;
+        const safeName = alter.name.replace(/\s+/g, "-");
+
+        let name = `<a href="#${safeName}" style="color:${alter.color};">${alter.name}</a>`;
         if (f.front?.comment?.trim()) {
           name += ` <span style="color:${alter.color};">(${f.front.comment})</span>`;
         }
