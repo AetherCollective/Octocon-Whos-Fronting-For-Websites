@@ -4,7 +4,7 @@ What you need:
   - Nginx
   - A website (to display who's fronting)
   - Your API Key (obtained by visiting https://beta.octocon.app/app/ and sniffing the network traffic)
-  - Your System ID (obtained by visiting https://beta.octocon.app/app/ and sniffing the network traffic)
+  - Your System ID (found on your Octocon's Profile Page)
 
 Configure the `docker-compose.yml` by updating build to point to where `OctoRelay.js` is stored, and set your `API_KEY` & `SYSTEM_ID`. After that, you can build and run it.
 
