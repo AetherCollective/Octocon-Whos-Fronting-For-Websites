@@ -1,0 +1,117 @@
+<div>
+  <h1 id="text01" class="text-component instance-1 style-2">Made by the Aether Collective</h1>
+  <p id="text02" class="text-component instance-2 style-1"><span class="p"><strong>Currently Fronting:</strong>
+      Checking...</span></p>
+</div>
+<script>
+  const relay = "YOUR_RELAY_IP_HERE";
+  const elementID = "text02";
+
+  let ws;
+  let currentFronts = [];
+  let primaryAlterId = null;
+
+  function connect() {
+    ws = new WebSocket("wss://" + relay);
+
+    ws.onmessage = e => {
+      try {
+        const msg = JSON.parse(e.data);
+
+        if (Array.isArray(msg)) {
+          currentFronts = msg;
+          primaryAlterId = currentFronts.find(f => f.primary)?.alter?.id ?? null;
+          updateFronts();
+          return;
+        }
+
+        switch (msg.event) {
+          case "fronts_snapshot":
+            currentFronts = msg.fronts || [];
+            primaryAlterId =
+              currentFronts.find(f => f.primary)?.alter?.id ?? null;
+            updateFronts();
+            break;
+
+          case "fronting_started":
+            if (msg.payload?.front) {
+              currentFronts.push(msg.payload.front);
+              updateFronts();
+            }
+            break;
+
+          case "fronting_ended":
+            if (msg.payload?.alter_id) {
+              currentFronts = currentFronts.filter(
+                f => f.alter.id !== msg.payload.alter_id
+              );
+              updateFronts();
+            }
+            break;
+
+          case "front_updated":
+            if (msg.payload?.front) {
+              currentFronts = currentFronts.map(f =>
+                f.alter.id === msg.payload.front.alter.id
+                  ? msg.payload.front
+                  : f
+              );
+              updateFronts();
+            }
+            break;
+
+          case "primary_front":
+            primaryAlterId = msg.payload?.alter_id ?? null;
+            updateFronts();
+            break;
+        }
+      } catch {
+        // ignore malformed
+      }
+    };
+
+    ws.onclose = () => setTimeout(connect, 3000);
+  }
+
+  function updateFronts() {
+    const container = document.getElementById(elementID);
+    if (!container) return;
+
+    // Filter out private alters before rendering
+    const visibleFronts = currentFronts.filter(
+      f => f.alter?.security_level !== "private"
+    );
+
+    if (!visibleFronts.length) {
+      container.innerHTML = "<strong>No one is currently fronting.</strong>";
+      return;
+    }
+
+    let ordered = [...visibleFronts];
+    if (primaryAlterId) {
+      ordered.sort((a, b) =>
+        a.alter.id === primaryAlterId ? -1 : b.alter.id === primaryAlterId ? 1 : 0
+      );
+    }
+
+    const members = ordered
+      .map(f => {
+        const alter = f.alter;
+        if (!alter) return null;
+
+        let name = `<span style="color:${alter.color};">${alter.name}</span>`;
+        if (f.front?.comment?.trim()) {
+          name += ` <span style="color:${alter.color};">(${f.front.comment})</span>`;
+        }
+        if (primaryAlterId && alter.id === primaryAlterId) {
+          name = `<strong>${name}</strong>`;
+        }
+        return name;
+      })
+      .filter(Boolean);
+
+    container.innerHTML = `<strong>Currently Fronting:</strong> ${members.join(", ")}`;
+  }
+
+  connect();
+</script>

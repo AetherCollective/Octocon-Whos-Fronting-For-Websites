@@ -1,0 +1,9 @@
+services:
+  octocon-relay:
+    build: /mnt/cache/docker-compose/Octocon-Relay
+    container_name: octocon-relay
+    ports:
+      - "3000:3000"
+    environment:
+      API_KEY: "YOUR_API_KEY_HERE"
+      SYSTEM_ID: "YOUR_SYSTEM_ID_HERE"
