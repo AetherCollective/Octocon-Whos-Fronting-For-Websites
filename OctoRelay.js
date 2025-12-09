@@ -20,9 +20,9 @@ const server = new WebSocket.Server({
 });
 
 // --------- Config ---------
-const MAX_QUEUE = 1000;               // cap client→upstream queue
-const MAX_ALTERS = 5000;              // cap number of cached alters
-const MAX_MESSAGE_BYTES = 512 * 1024; // drop messages larger than 512KB
+const MAX_QUEUE = 200;                 // cap client→upstream queue
+const MAX_ALTERS = 1000;               // cap number of cached alters
+const MAX_MESSAGE_BYTES = 512 * 1024;  // drop messages larger than 512KB
 
 // --------- LRU cache for alters ---------
 class LRUMap {
@@ -82,7 +82,8 @@ server.on('connection', client => {
   let socket = null;
   let channel = null;
 
-  const ctx = { client, queue };
+  // Keep only minimal refs to avoid retention
+  const ctx = { client, queue, socket: null, channel: null };
   connections.add(ctx);
 
   function teardownUpstream() {
@@ -90,6 +91,9 @@ server.on('connection', client => {
     channel = null;
     try { if (socket) socket.disconnect(() => {}); } catch {}
     socket = null;
+
+    ctx.channel = null;
+    ctx.socket = null;
   }
 
   function teardownClient() {
@@ -103,25 +107,22 @@ server.on('connection', client => {
   }
 
   function flushQueue() {
-    if (!channel) return;
-    while (queue.length) {
-      // Define your upstream push semantics if needed:
-      // const msg = queue.shift();
-      // channel.push("client_message", { raw: msg.toString() });
-      queue.shift(); // currently dropping buffered messages by design
-    }
+    // No upstream push semantics defined; drop buffered messages
+    queue.length = 0;
   }
 
   // Upstream (Phoenix) setup
   socket = makePhoenixSocket();
-
-  // IMPORTANT: include token in the channel join payload
   channel = socket.channel(`system:${SYSTEM_ID}`, { token: API_KEY });
 
-  // Observe socket status (optional, silent unless needed)
-  socket.onOpen(() => { /* connected to endpoint */ });
-  socket.onError(() => { /* transport error; phoenix will retry */ });
-  socket.onClose(() => { /* socket closed; phoenix will retry */ });
+  // keep references for server-close cleanup
+  ctx.socket = socket;
+  ctx.channel = channel;
+
+  // Optional lifecycle hooks (silent)
+  socket.onOpen(() => {});
+  socket.onError(() => {});
+  socket.onClose(() => {});
 
   channel.join()
     .receive('ok', resp => {
@@ -149,12 +150,8 @@ server.on('connection', client => {
 
       flushQueue();
     })
-    .receive('error', () => {
-      // join error; SDK will manage reconnects
-    })
-    .receive('timeout', () => {
-      // join timeout; SDK will retry
-    });
+    .receive('error', () => {})
+    .receive('timeout', () => {});
 
   // Incremental events from upstream
   const forwardEvent = (event, payload) => {
@@ -200,9 +197,7 @@ server.on('connection', client => {
     const size = Buffer.isBuffer(msg) ? msg.length : Buffer.byteLength(msg);
     if (size > MAX_MESSAGE_BYTES) return;
 
-    // Define a push event if you want to relay client messages upstream:
-    // if (channel) channel.push("client_message", { raw: msg.toString() });
-    // else enqueue(msg);
+    // No upstream push defined; buffer until join then drop
     if (channel) {
       // No-op by default
     } else {
@@ -213,6 +208,7 @@ server.on('connection', client => {
   client.on('close', () => {
     teardownUpstream();
     queue.length = 0;
+    try { client.removeAllListeners(); } catch {}
     connections.delete(ctx);
   });
 
@@ -224,15 +220,30 @@ server.on('connection', client => {
   });
 });
 
+// Handle server close: terminate clients and tear down upstream references
+server.on('close', () => {
+  connections.forEach(ctx => {
+    try { if (ctx.channel) ctx.channel.leave(); } catch {}
+    try { if (ctx.socket) ctx.socket.disconnect(() => {}); } catch {}
+    try { ctx.client.terminate(); } catch {}
+    try { ctx.queue.length = 0; } catch {}
+  });
+  connections.clear();
+});
+
 // ---------- Graceful shutdown for Docker (SIGTERM/SIGINT) ----------
 function shutdown() {
   try { server.close(); } catch {}
 
   connections.forEach(ctx => {
+    try { if (ctx.channel) ctx.channel.leave(); } catch {}
+    try { if (ctx.socket) ctx.socket.disconnect(() => {}); } catch {}
     try { ctx.client.close(); } catch {}
     try { ctx.client.terminate(); } catch {}
     try { ctx.queue.length = 0; } catch {}
   });
+
+  connections.clear();
 
   setTimeout(() => { process.exit(0); }, 250);
 }
