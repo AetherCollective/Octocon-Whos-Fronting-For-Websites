@@ -7,6 +7,7 @@ COPY OctoRelay.js /app/
 # Install dependencies
 RUN npm install ws
 RUN npm install phoenix
+RUN npm install http
 
 # Run your script
 CMD ["node", "OctoRelay.js"]

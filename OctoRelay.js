@@ -2,6 +2,7 @@
 
 const { Socket } = require('phoenix'); // npm i phoenix
 const WebSocket = require('ws');       // npm i ws
+const http = require('http');          // npm i http
 
 // Secrets only available server-side
 const API_KEY = process.env.API_KEY;
@@ -12,12 +13,27 @@ if (!API_KEY || !SYSTEM_ID) {
   process.exit(1);
 }
 
-// Server: disable permessage deflate and cap incoming client payloads
-const server = new WebSocket.Server({
-  port: 3000,
-  perMessageDeflate: false,
-  maxPayload: 512 * 1024 // drop client messages larger than 512KB
+// Create HTTP server to handle /status and WS upgrades
+const httpServer = http.createServer((req, res) => {
+  if (req.url === '/status') {
+    res.writeHead(200, { 'Content-Type': 'text/plain' });
+    return res.end('OK');
+  }
+
+  // Any non-status HTTP request gets a simple 404
+  res.writeHead(404, { 'Content-Type': 'text/plain' });
+  res.end('Not found');
 });
+
+// Attach WebSocket server to the HTTP server
+const server = new WebSocket.Server({
+  server: httpServer,
+  perMessageDeflate: false,
+  maxPayload: 512 * 1024
+});
+
+// Start listening
+httpServer.listen(3000);
 
 // --------- Config ---------
 const MAX_QUEUE = 200;                 // cap client→upstream queue
