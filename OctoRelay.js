@@ -3,6 +3,8 @@
 const { Socket } = require('phoenix'); // npm i phoenix
 const WebSocket = require('ws');       // npm i ws
 const http = require('http');          // npm i http
+const fs = require('fs');              // npm i fs
+const path = require('path');          // npm i fs
 
 // Secrets only available server-side
 const API_KEY = process.env.API_KEY;
@@ -12,6 +14,50 @@ if (!API_KEY || !SYSTEM_ID) {
   console.error('Missing API_KEY or SYSTEM_ID');
   process.exit(1);
 }
+
+// --------- History persistence ---------
+const HISTORY_FILE = path.join(__dirname, "data", "history.json");
+
+// in-memory: Map<alterId, epoch>
+const lastFronted = new Map();
+
+function loadHistory() {
+  try {
+    const raw = fs.readFileSync(HISTORY_FILE, 'utf8');
+    const obj = JSON.parse(raw);
+    for (const [id, ts] of Object.entries(obj)) {
+      if (typeof ts === 'string') lastFronted.set(id, ts);
+    }
+    console.log('Loaded history:', lastFronted.size, 'entries');
+  } catch (e) {
+    console.warn('No history file found or failed to parse, starting fresh');
+  }
+}
+
+function saveHistory() {
+  const obj = Object.fromEntries(lastFronted.entries());
+  try {
+    fs.writeFileSync(HISTORY_FILE, JSON.stringify(obj, null, 2), 'utf8');
+  } catch (e) {
+    console.error('Failed to write history file:', e);
+  }
+}
+
+function updateLastFronted(alterId, front) {
+  if (!alterId || !front) return;
+
+  // Prefer time_end if present, otherwise time_start
+  const ts = front.time_end || front.time_start;
+  if (!ts) return;
+
+  // Store the ISO timestamp directly
+  lastFronted.set(alterId, ts);
+
+  saveHistory();
+}
+
+// load at boot
+loadHistory();
 
 // Create HTTP server to handle /status and WS upgrades
 const httpServer = http.createServer((req, res) => {
@@ -103,9 +149,9 @@ server.on('connection', client => {
   connections.add(ctx);
 
   function teardownUpstream() {
-    try { if (channel) channel.leave(); } catch {}
+    try { if (channel) channel.leave(); } catch { }
     channel = null;
-    try { if (socket) socket.disconnect(() => {}); } catch {}
+    try { if (socket) socket.disconnect(() => { }); } catch { }
     socket = null;
 
     ctx.channel = null;
@@ -113,8 +159,8 @@ server.on('connection', client => {
   }
 
   function teardownClient() {
-    try { client.removeAllListeners(); } catch {}
-    try { client.close(); } catch {}
+    try { client.removeAllListeners(); } catch { }
+    try { client.close(); } catch { }
   }
 
   function enqueue(msg) {
@@ -136,9 +182,52 @@ server.on('connection', client => {
   ctx.channel = channel;
 
   // Optional lifecycle hooks (silent)
-  socket.onOpen(() => {});
-  socket.onError(() => {});
-  socket.onClose(() => {});
+  socket.onOpen(() => { });
+  socket.onError(() => { });
+  socket.onClose(() => { });
+
+  // Handle raw Phoenix messages (needed for phx_reply)
+  socket.onMessage(msg => {
+    try {
+      // 🔥 1. Phoenix tuple form: [joinRef, ref, topic, event, payload]
+      if (Array.isArray(msg)) {
+        const [_, __, topic, event, payload] = msg;
+
+        if (topic === `system:${SYSTEM_ID}` && event === "fronting_ended") {
+          const alterId = payload?.alter_id;
+          if (alterId) {
+            // Use current time as the "front" end time
+            const nowIso = new Date().toISOString();
+            updateLastFronted(alterId, { time_end: nowIso });
+            broadcast({
+              event: "last_fronted_update",
+              alter_id: alterId,
+              timestamp: nowIso
+            });
+
+          }
+        }
+
+        return; // handled tuple, stop here
+      }
+
+      // 🔥 2. Object form (your existing logic)
+      const { topic, event, payload } = msg;
+      if (topic !== `system:${SYSTEM_ID}`) return;
+
+      if (event === "phx_reply" && payload?.response?.fronts) {
+        const fronts = payload.response.fronts;
+        for (const f of fronts) {
+          const sanitized = sanitizeFront(f);
+          if (!sanitized) continue;
+          const alterId = sanitized.alter.id;
+          updateLastFronted(alterId, sanitized.front);
+        }
+      }
+    } catch {
+      // ignore malformed messages
+    }
+  });
 
   channel.join()
     .receive('ok', resp => {
@@ -160,14 +249,19 @@ server.on('connection', client => {
         const frontsOnly = resp.fronts.map(sanitizeFront).filter(Boolean);
         const out = JSON.stringify({ event: 'fronts_snapshot', fronts: frontsOnly });
         if (Buffer.byteLength(out) <= MAX_MESSAGE_BYTES) {
-          try { client.send(out); } catch {}
+          try { client.send(out); } catch { }
+        }
+
+        // seed history from snapshot
+        for (const f of frontsOnly) {
+          updateLastFronted(f.alter.id, f.front);
         }
       }
 
       flushQueue();
     })
-    .receive('error', () => {})
-    .receive('timeout', () => {});
+    .receive('error', () => { })
+    .receive('timeout', () => { });
 
   // Incremental events from upstream
   const forwardEvent = (event, payload) => {
@@ -180,11 +274,15 @@ server.on('connection', client => {
       const sanitized = sanitizeFront(payload.front);
       if (!sanitized) return;
       payload.front = sanitized;
+
+      // update last-fronted history
+      const alterId = sanitized.alter.id;
+      updateLastFronted(alterId, sanitized.front);
     }
 
     const out = JSON.stringify({ event, payload });
     if (Buffer.byteLength(out) <= MAX_MESSAGE_BYTES) {
-      try { client.send(out); } catch {}
+      try { client.send(out); } catch { }
     }
   };
 
@@ -208,10 +306,26 @@ server.on('connection', client => {
     }
   });
 
-  // Client → upstream bounds (optional)
   client.on('message', msg => {
     const size = Buffer.isBuffer(msg) ? msg.length : Buffer.byteLength(msg);
     if (size > MAX_MESSAGE_BYTES) return;
+
+    let parsed = null;
+    try {
+      parsed = JSON.parse(msg.toString());
+    } catch { }
+
+    if (parsed && parsed.event === 'get_last_fronted_all') {
+      const historyObj = Object.fromEntries(lastFronted.entries());
+      const out = JSON.stringify({
+        event: 'last_fronted_all',
+        history: historyObj
+      });
+      if (Buffer.byteLength(out) <= MAX_MESSAGE_BYTES) {
+        try { client.send(out); } catch { }
+      }
+      return;
+    }
 
     // No upstream push defined; buffer until join then drop
     if (channel) {
@@ -224,7 +338,7 @@ server.on('connection', client => {
   client.on('close', () => {
     teardownUpstream();
     queue.length = 0;
-    try { client.removeAllListeners(); } catch {}
+    try { client.removeAllListeners(); } catch { }
     connections.delete(ctx);
   });
 
@@ -239,24 +353,24 @@ server.on('connection', client => {
 // Handle server close: terminate clients and tear down upstream references
 server.on('close', () => {
   connections.forEach(ctx => {
-    try { if (ctx.channel) ctx.channel.leave(); } catch {}
-    try { if (ctx.socket) ctx.socket.disconnect(() => {}); } catch {}
-    try { ctx.client.terminate(); } catch {}
-    try { ctx.queue.length = 0; } catch {}
+    try { if (ctx.channel) ctx.channel.leave(); } catch { }
+    try { if (ctx.socket) ctx.socket.disconnect(() => { }); } catch { }
+    try { ctx.client.terminate(); } catch { }
+    try { ctx.queue.length = 0; } catch { }
   });
   connections.clear();
 });
 
 // ---------- Graceful shutdown for Docker (SIGTERM/SIGINT) ----------
 function shutdown() {
-  try { server.close(); } catch {}
+  try { server.close(); } catch { }
 
   connections.forEach(ctx => {
-    try { if (ctx.channel) ctx.channel.leave(); } catch {}
-    try { if (ctx.socket) ctx.socket.disconnect(() => {}); } catch {}
-    try { ctx.client.close(); } catch {}
-    try { ctx.client.terminate(); } catch {}
-    try { ctx.queue.length = 0; } catch {}
+    try { if (ctx.channel) ctx.channel.leave(); } catch { }
+    try { if (ctx.socket) ctx.socket.disconnect(() => { }); } catch { }
+    try { ctx.client.close(); } catch { }
+    try { ctx.client.terminate(); } catch { }
+    try { ctx.queue.length = 0; } catch { }
   });
 
   connections.clear();
