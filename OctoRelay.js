@@ -145,21 +145,34 @@ function loadHistory() {
   }
 }
 
-function saveHistory() {
+function saveHistory(alterId, ts) {
   const obj = Object.fromEntries(lastFronted.entries());
   try {
     fs.writeFileSync(HISTORY_FILE, JSON.stringify(obj, null, 2), 'utf8');
-    log('HISTORY', `Saved ${Object.keys(obj).length} entries`);
+    log('HISTORY', `Saved ${Object.keys(obj).length} entries`, { alterId, ts });
   } catch (e) {
     log('ERROR', 'Failed to write history file', { error: String(e) });
   }
 }
 
 function updateLastFronted(alterId, front) {
-  const ts = front.time_end || front.time_start;
+  // Prefer time_end, but ONLY if it exists.
+  const ts = front.time_end ?? front.time_start;
   if (!ts) return;
-  lastFronted.set(alterId, ts);
-  saveHistory();
+
+  // If time_end exists, ignore time_start entirely.
+  if (front.time_end) {
+    // If we already saved this exact time_end, skip.
+    if (lastFronted.get(alterId) === front.time_end) return;
+    lastFronted.set(alterId, front.time_end);
+    return saveHistory(alterId, front.time_end);
+  }
+
+  // Only reach here if NO time_end exists.
+  // Now we allow time_start updates.
+  if (lastFronted.get(alterId) === front.time_start) return;
+  lastFronted.set(alterId, front.time_start);
+  saveHistory(alterId, front.time_start);
 }
 
 // =========================
@@ -330,7 +343,7 @@ function setupUpstream() {
 
         for (const f of sanitizedFronts) updateLastFronted(f.alter.id, f.front);
       }
-    } catch {}
+    } catch { }
   });
 
   upstreamChannel
@@ -412,7 +425,7 @@ const connections = new Set();
 function safeSend(client, obj) {
   try {
     client.send(JSON.stringify(obj));
-  } catch {}
+  } catch { }
 }
 
 on('broadcast', msg => {
