@@ -36,6 +36,7 @@
 
     ws.onopen = () => {
       ws.send(JSON.stringify({ event: "get_last_fronted_all" }));
+      ws.send(JSON.stringify({ event: "get_current_fronts" }));
     };
 
     ws.onmessage = event => {
@@ -68,7 +69,7 @@
             const endedId = msg.payload.alter_id;
             currentFronts = currentFronts.filter(f => f.alter.id !== endedId);
             updateFronts();
-            lastFrontedHistory[String(endedId)] = new Date().toISOString();
+            // ❗ no local timestamp here anymore – relay sends last_fronted_update
           }
           break;
 
@@ -83,6 +84,12 @@
           }
           break;
 
+        case "current_fronts":
+          currentFronts = msg.fronts || [];
+          primaryAlterId = currentFronts.find(f => f.primary)?.alter?.id ?? null;
+          updateFronts();
+          break;
+
         case "primary_front":
           primaryAlterId = msg.payload?.alter_id ?? null;
           updateFronts();
@@ -95,7 +102,8 @@
 
         case "last_fronted_update":
           if (msg.alter_id && msg.timestamp) {
-            lastFrontedHistory[String(msg.alter_id)] = msg.timestamp;
+            const key = String(msg.alter_id);
+            lastFrontedHistory[key] = msg.timestamp;
           }
           break;
       }
@@ -134,8 +142,8 @@
       return;
     }
 
-    const now = new Date();
-    const then = new Date(ts);
+    const now = Date.now();
+    const then = new Date(ts).getTime();
     const diffMs = now - then;
 
     if (diffMs < 0) {

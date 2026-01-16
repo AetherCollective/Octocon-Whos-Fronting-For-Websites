@@ -1,32 +1,136 @@
 'use strict';
 
+/**
+ * OctoRelay – single-file, production-style relay
+ * - Persistent upstream Phoenix connection
+ * - Event bus
+ * - State store (currentFronts + lastFronted + alterSecurity)
+ * - History persistence
+ * - WebSocket server for clients
+ * - Structured logging
+ */
+
 const { Socket } = require('phoenix');
 const WebSocket = require('ws');
 const http = require('http');
 const fs = require('fs');
 const path = require('path');
 
-// Secrets only available server-side
+// =========================
+// Environment & constants
+// =========================
+
 const API_KEY = process.env.API_KEY;
 const SYSTEM_ID = process.env.SYSTEM_ID;
-
-// --------- Logging Control ---------
 const LOGGING = process.env.LOGGING;
-function logHistory(...args) {
-  if (LOGGING) console.log(...args);
-}
-
 
 if (!API_KEY || !SYSTEM_ID) {
   console.error('Missing API_KEY or SYSTEM_ID');
   process.exit(1);
 }
 
-// --------- History persistence ---------
-const HISTORY_FILE = path.join(__dirname, "data", "history.json");
+const PORT = 3000;
+const HISTORY_FILE = path.join(__dirname, 'data', 'history.json');
+const MAX_ALTERS = 1000;
+const MAX_MESSAGE_BYTES = 512 * 1024;
 
-// in-memory: Map<alterId, epoch>
+// =========================
+// Logger
+// =========================
+
+function formatLogTimestamp() {
+  const d = new Date();
+  const pad = (n, w = 2) => String(n).padStart(w, '0');
+
+  const mm = pad(d.getMonth() + 1);
+  const dd = pad(d.getDate());
+  const yyyy = d.getFullYear();
+
+  const hh = pad(d.getHours());
+  const min = pad(d.getMinutes());
+  const ss = pad(d.getSeconds());
+  const msec = pad(d.getMilliseconds(), 3);
+
+  return `${mm}/${dd}/${yyyy} ${hh}:${min}:${ss}.${msec}`;
+}
+
+function log(source, message, data) {
+  if (!LOGGING) return;
+  const ts = formatLogTimestamp();
+  const base = `[${ts}] [${source}] ${message}`;
+  if (data !== undefined) {
+    try {
+      console.log(base, JSON.stringify(data, null, 2));
+    } catch {
+      console.log(base, data);
+    }
+  } else {
+    console.log(base);
+  }
+}
+
+// =========================
+// Simple event bus
+// =========================
+
+const listeners = new Map();
+
+function on(eventName, fn) {
+  if (!listeners.has(eventName)) listeners.set(eventName, new Set());
+  listeners.get(eventName).add(fn);
+}
+
+async function emit(eventName, payload) {
+  const set = listeners.get(eventName);
+  if (!set) return;
+  for (const fn of set) {
+    try {
+      await fn(payload);
+    } catch (e) {
+      log('EVENT', `Handler error for ${eventName}`, { error: String(e) });
+    }
+  }
+}
+
+// =========================
+// LRU cache for alters
+// =========================
+
+class LRUMap {
+  constructor(maxSize) {
+    this.maxSize = maxSize;
+    this.map = new Map();
+  }
+  set(key, value) {
+    if (this.map.has(key)) this.map.delete(key);
+    this.map.set(key, value);
+    if (this.map.size > this.maxSize) {
+      const oldest = this.map.keys().next().value;
+      log('LRU', 'Evicting oldest alter from cache', { oldest });
+      this.map.delete(oldest);
+    }
+  }
+  get(key) {
+    return this.map.get(key);
+  }
+}
+
+// =========================
+// State store
+// =========================
+
 const lastFronted = new Map();
+const currentFronts = new Map();
+const alterSecurity = new LRUMap(MAX_ALTERS);
+
+const systemStatus = {
+  upstreamConnected: false,
+  channelJoined: false,
+};
+
+// =========================
+// History persistence
+// =========================
 
 function loadHistory() {
   try {
@@ -35,9 +139,9 @@ function loadHistory() {
     for (const [id, ts] of Object.entries(obj)) {
       if (typeof ts === 'string') lastFronted.set(id, ts);
     }
-    logHistory(`[HISTORY] Loaded ${lastFronted.size} entries`);
+    log('HISTORY', `Loaded ${lastFronted.size} entries`);
   } catch (e) {
-    logHistory(`[HISTORY] No history file found or failed to parse, starting fresh`);
+    log('HISTORY', 'No history file found or failed to parse, starting fresh', { error: String(e) });
   }
 }
 
@@ -45,88 +149,27 @@ function saveHistory() {
   const obj = Object.fromEntries(lastFronted.entries());
   try {
     fs.writeFileSync(HISTORY_FILE, JSON.stringify(obj, null, 2), 'utf8');
-    logHistory(`[HISTORY] Saved ${Object.keys(obj).length} entries`);
+    log('HISTORY', `Saved ${Object.keys(obj).length} entries`);
   } catch (e) {
-    console.error('Failed to write history file:', e);
+    log('ERROR', 'Failed to write history file', { error: String(e) });
   }
 }
 
 function updateLastFronted(alterId, front) {
-  if (!alterId || !front) return;
-
   const ts = front.time_end || front.time_start;
   if (!ts) return;
-
-  logHistory(`[HISTORY] alter ${alterId} → ${ts}`);
-
   lastFronted.set(alterId, ts);
   saveHistory();
 }
 
-// load at boot
-loadHistory();
+// =========================
+// Sanitization
+// =========================
 
-// Create HTTP server to handle /status and WS upgrades
-const httpServer = http.createServer((req, res) => {
-  if (req.url === '/status') {
-    res.writeHead(200, { 'Content-Type': 'text/plain' });
-    return res.end('OK');
-  }
-
-  res.writeHead(404, { 'Content-Type': 'text/plain' });
-  res.end('Not found');
-});
-
-// Attach WebSocket server to the HTTP server
-const server = new WebSocket.Server({
-  server: httpServer,
-  perMessageDeflate: false,
-  maxPayload: 512 * 1024
-});
-
-// Start listening
-httpServer.listen(3000);
-
-// --------- Config ---------
-const MAX_QUEUE = 200;
-const MAX_ALTERS = 1000;
-const MAX_MESSAGE_BYTES = 512 * 1024;
-
-// --------- LRU cache for alters ---------
-class LRUMap {
-  constructor(maxSize) { this.maxSize = maxSize; this.map = new Map(); }
-  set(key, value) {
-    if (this.map.has(key)) this.map.delete(key);
-    this.map.set(key, value);
-    if (this.map.size > this.maxSize) {
-      const oldest = this.map.keys().next().value;
-      this.map.delete(oldest);
-    }
-  }
-  get(key) { return this.map.get(key); }
-  clear() { this.map.clear(); }
-}
-
-const alterSecurity = new LRUMap(MAX_ALTERS);
-
-// Track active connections
-const connections = new Set();
-
-// Broadcast helper (silent)
-function broadcast(obj) {
-  const out = JSON.stringify(obj);
-  for (const ctx of connections) {
-    try { ctx.client.send(out); } catch { }
-  }
-}
-
-// Helper: sanitize a single front object
 function sanitizeFront(f) {
-  if (!f || !f.alter || !f.front) return null;
-  const alterId = f.alter.id;
-  if (!alterId) return null;
+  if (!f?.alter?.id || !f.front) return null;
 
-  const sec = alterSecurity.get(alterId)?.security_level;
+  const sec = alterSecurity.get(f.alter.id)?.security_level;
   if (sec !== 'public') return null;
 
   return {
@@ -136,109 +179,172 @@ function sanitizeFront(f) {
       id: f.front.id,
       comment: f.front.comment,
       time_start: f.front.time_start,
-      time_end: f.front.time_end
-    }
+      time_end: f.front.time_end,
+    },
   };
 }
 
-// Create a Phoenix Socket factory
+// =========================
+// Fronting state machine
+// =========================
+
+function handleFrontsSnapshot(fronts) {
+  currentFronts.clear();
+  for (const f of fronts) currentFronts.set(f.alter.id, f);
+}
+
+function handleFrontingStarted(payload) {
+  const sanitized = sanitizeFront(payload.front);
+  if (!sanitized) return;
+  currentFronts.set(sanitized.alter.id, sanitized);
+  updateLastFronted(sanitized.alter.id, sanitized.front);
+}
+
+function handleFrontUpdated(payload) {
+  const sanitized = sanitizeFront(payload.front);
+  if (!sanitized) return;
+  currentFronts.set(sanitized.alter.id, sanitized);
+  updateLastFronted(sanitized.alter.id, sanitized.front);
+}
+
+/*  
+===========================================================
+⭐ FIXED VERSION OF handleFrontingEnded
+===========================================================
+*/
+function handleFrontingEnded(payload) {
+  const alterId = payload?.alter_id;
+  if (!alterId) return;
+
+  currentFronts.delete(alterId);
+
+  const time_end =
+    payload?.front?.time_end ||
+    payload?.time_end ||
+    new Date().toISOString();
+
+  updateLastFronted(alterId, { time_end });
+
+  emit('broadcast', {
+    type: 'last_fronted_update',
+    alter_id: alterId,
+    timestamp: time_end,
+  });
+}
+
+function handlePrimaryFront(payload) {
+  const alterId = payload?.alter_id;
+  if (!alterId) return;
+  for (const f of currentFronts.values()) f.primary = false;
+  const entry = currentFronts.get(alterId);
+  if (entry) entry.primary = true;
+}
+
+// =========================
+// Upstream (Phoenix) connection
+// =========================
+
+let upstreamSocket = null;
+let upstreamChannel = null;
+let reconnectTimer = null;
+
 function makePhoenixSocket() {
   const socket = new Socket('wss://api.octocon.app/api/socket', {
     params: { token: API_KEY },
     transport: WebSocket,
     heartbeatIntervalMs: 30000,
-    reconnectAfterMs: tries => [1000, 2000, 5000, 5000][Math.min(tries, 3)]
+    reconnectAfterMs: tries => [1000, 2000, 5000, 10000][Math.min(tries, 3)],
   });
+
+  socket.onOpen(() => {
+    systemStatus.upstreamConnected = true;
+  });
+
+  socket.onClose(() => {
+    systemStatus.upstreamConnected = false;
+    systemStatus.channelJoined = false;
+    scheduleReconnect();
+  });
+
   socket.connect();
   return socket;
 }
 
-server.on('connection', client => {
-  const queue = [];
-  let socket = null;
-  let channel = null;
+function scheduleReconnect() {
+  if (reconnectTimer) return;
+  reconnectTimer = setTimeout(() => {
+    reconnectTimer = null;
+    setupUpstream();
+  }, 2000);
+}
 
-  const ctx = { client, queue, socket: null, channel: null };
-  connections.add(ctx);
+function setupUpstream() {
+  upstreamSocket = makePhoenixSocket();
+  upstreamChannel = upstreamSocket.channel(`system:${SYSTEM_ID}`, { token: API_KEY });
 
-  function teardownUpstream() {
-    try { if (channel) channel.leave(); } catch { }
-    channel = null;
-    try { if (socket) socket.disconnect(() => { }); } catch { }
-    socket = null;
-
-    ctx.channel = null;
-    ctx.socket = null;
-  }
-
-  function teardownClient() {
-    try { client.removeAllListeners(); } catch { }
-    try { client.close(); } catch { }
-  }
-
-  function enqueue(msg) {
-    if (queue.length >= MAX_QUEUE) queue.shift();
-    queue.push(msg);
-  }
-
-  function flushQueue() {
-    queue.length = 0;
-  }
-
-  // Upstream setup
-  socket = makePhoenixSocket();
-  channel = socket.channel(`system:${SYSTEM_ID}`, { token: API_KEY });
-
-  ctx.socket = socket;
-  ctx.channel = channel;
-
-  // Handle raw Phoenix messages
-  socket.onMessage(msg => {
+  upstreamSocket.onMessage(msg => {
     try {
       if (Array.isArray(msg)) {
         const [_, __, topic, event, payload] = msg;
 
-        if (topic === `system:${SYSTEM_ID}` && event === "fronting_ended") {
+        if (topic === `system:${SYSTEM_ID}` && event === 'fronting_ended') {
           const alterId = payload?.alter_id;
-          if (alterId) {
-            const nowIso = new Date().toISOString();
-            updateLastFronted(alterId, { time_end: nowIso });
+          if (!alterId) return;
 
-            broadcast({
-              event: "last_fronted_update",
-              alter_id: alterId,
-              timestamp: nowIso
-            });
-          }
+          /*  
+          ===========================================================
+          ⭐ FIXED RAW-ARRAY fronting_ended HANDLER
+          ===========================================================
+          */
+          const time_end =
+            payload?.front?.time_end ||
+            payload?.time_end ||
+            new Date().toISOString();
+
+          updateLastFronted(alterId, { time_end });
+
+          emit('broadcast', {
+            type: 'last_fronted_update',
+            alter_id: alterId,
+            timestamp: time_end,
+          });
         }
 
         return;
       }
 
       const { topic, event, payload } = msg;
-
       if (topic !== `system:${SYSTEM_ID}`) return;
 
-      if (event === "phx_reply" && payload?.response?.fronts) {
-        const fronts = payload.response.fronts;
-        for (const f of fronts) {
-          const sanitized = sanitizeFront(f);
-          if (!sanitized) continue;
-          updateLastFronted(sanitized.alter.id, sanitized.front);
-        }
+      if (event === 'phx_reply' && payload?.response?.fronts) {
+        const sanitizedFronts = payload.response.fronts
+          .map(sanitizeFront)
+          .filter(Boolean);
+
+        handleFrontsSnapshot(sanitizedFronts);
+
+        emit('broadcast', {
+          type: 'fronts_snapshot',
+          fronts: sanitizedFronts,
+        });
+
+        for (const f of sanitizedFronts) updateLastFronted(f.alter.id, f.front);
       }
-    } catch { }
+    } catch {}
   });
 
-  channel.join()
+  upstreamChannel
+    .join()
     .receive('ok', resp => {
+      systemStatus.channelJoined = true;
+
       if (Array.isArray(resp?.alters)) {
         for (const a of resp.alters) {
           if (a?.id && a.security_level === 'public') {
             alterSecurity.set(a.id, {
               security_level: 'public',
               name: a.name,
-              color: a.color
+              color: a.color,
             });
           }
         }
@@ -246,137 +352,127 @@ server.on('connection', client => {
 
       if (Array.isArray(resp?.fronts)) {
         const frontsOnly = resp.fronts.map(sanitizeFront).filter(Boolean);
+        handleFrontsSnapshot(frontsOnly);
 
-        const out = JSON.stringify({ event: 'fronts_snapshot', fronts: frontsOnly });
-        if (Buffer.byteLength(out) <= MAX_MESSAGE_BYTES) {
-          try { client.send(out); } catch { }
-        }
+        emit('broadcast', {
+          type: 'fronts_snapshot',
+          fronts: frontsOnly,
+        });
 
-        for (const f of frontsOnly) {
-          updateLastFronted(f.alter.id, f.front);
-        }
+        for (const f of frontsOnly) updateLastFronted(f.alter.id, f.front);
       }
+    })
+    .receive('error', () => scheduleReconnect())
+    .receive('timeout', () => scheduleReconnect());
 
-      flushQueue();
-    });
+  upstreamChannel.on('fronting_started', p => forwardEvent('fronting_started', p));
+  upstreamChannel.on('fronting_ended', p => forwardEvent('fronting_ended', p));
+  upstreamChannel.on('front_updated', p => forwardEvent('front_updated', p));
+  upstreamChannel.on('primary_front', p => forwardEvent('primary_front', p));
 
-  // Incremental events
-  const forwardEvent = (event, payload) => {
-  // Only allow public alters
-  if ((event === 'fronting_ended' || event === 'primary_front') && payload?.alter_id) {
-    const sec = alterSecurity.get(payload.alter_id)?.security_level;
-    if (sec !== 'public') return;
+  function forwardEvent(event, payload) {
+    if (event === 'fronting_started') handleFrontingStarted(payload);
+    else if (event === 'front_updated') handleFrontUpdated(payload);
+    else if (event === 'fronting_ended') handleFrontingEnded(payload);
+    else if (event === 'primary_front') handlePrimaryFront(payload);
+
+    emit('broadcast', { type: event, payload });
+  }
+}
+
+// =========================
+// HTTP + WebSocket server
+// =========================
+
+const httpServer = http.createServer((req, res) => {
+  if (req.url === '/status') {
+    res.writeHead(200, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify({
+      ok: true,
+      upstreamConnected: systemStatus.upstreamConnected,
+      channelJoined: systemStatus.channelJoined,
+      currentFronts: currentFronts.size,
+      lastFronted: lastFronted.size,
+    }));
+    return;
   }
 
-  // --- CASE 1: front object exists (fronting_started, front_updated)
-  if (payload?.front) {
-    const sanitized = sanitizeFront(payload.front);
-    if (!sanitized) return;
-    payload.front = sanitized;
+  res.writeHead(404);
+  res.end('Not found');
+});
 
-    updateLastFronted(sanitized.alter.id, sanitized.front);
+const server = new WebSocket.Server({
+  server: httpServer,
+  perMessageDeflate: false,
+  maxPayload: MAX_MESSAGE_BYTES,
+});
+
+const connections = new Set();
+
+function safeSend(client, obj) {
+  try {
+    client.send(JSON.stringify(obj));
+  } catch {}
+}
+
+on('broadcast', msg => {
+  let out;
+
+  if (msg.type === 'fronts_snapshot') {
+    out = { event: 'fronts_snapshot', fronts: msg.fronts };
+  } else if (msg.type === 'last_fronted_update') {
+    out = {
+      event: 'last_fronted_update',
+      alter_id: msg.alter_id,
+      timestamp: msg.timestamp,
+    };
+  } else {
+    out = { event: msg.type, payload: msg.payload };
   }
 
-  // --- CASE 2: fronting_ended WITHOUT a front object (common case)
-  else if (event === 'fronting_ended' && payload?.alter_id) {
-    const nowIso = new Date().toISOString();
-    updateLastFronted(payload.alter_id, { time_end: nowIso });
-  }
+  for (const ctx of connections) safeSend(ctx.client, out);
+});
 
-  // Forward to client
-  const out = JSON.stringify({ event, payload });
-  if (Buffer.byteLength(out) <= MAX_MESSAGE_BYTES) {
-    try { client.send(out); } catch { }
-  }
-};
+server.on('connection', client => {
+  connections.add({ client });
 
-  channel.on('fronting_started', payload => forwardEvent('fronting_started', payload));
-  channel.on('fronting_ended', payload => forwardEvent('fronting_ended', payload));
-  channel.on('front_updated', payload => forwardEvent('front_updated', payload));
-  channel.on('primary_front', payload => forwardEvent('primary_front', payload));
-
-  channel.on('alter_updated', payload => {
-    const a = payload?.alter;
-    if (a?.id && a.security_level === 'public') {
-      alterSecurity.set(a.id, { security_level: 'public', name: a.name, color: a.color });
-    }
-  });
-
-  channel.on('alter_created', payload => {
-    const a = payload?.alter;
-    if (a?.id && a.security_level === 'public') {
-      alterSecurity.set(a.id, { security_level: 'public', name: a.name, color: a.color });
-    }
-  });
+  const fronts = Array.from(currentFronts.values());
+  safeSend(client, { event: 'fronts_snapshot', fronts });
 
   client.on('message', msg => {
-    const size = Buffer.isBuffer(msg) ? msg.length : Buffer.byteLength(msg);
-    if (size > MAX_MESSAGE_BYTES) return;
+    let parsed;
+    try { parsed = JSON.parse(msg); } catch { return; }
 
-    let parsed = null;
-    try {
-      parsed = JSON.parse(msg.toString());
-    } catch { }
-
-    if (parsed && parsed.event === 'get_last_fronted_all') {
-      const historyObj = Object.fromEntries(lastFronted.entries());
-      const out = JSON.stringify({
+    if (parsed.event === 'get_last_fronted_all') {
+      safeSend(client, {
         event: 'last_fronted_all',
-        history: historyObj
+        history: Object.fromEntries(lastFronted.entries()),
       });
-      if (Buffer.byteLength(out) <= MAX_MESSAGE_BYTES) {
-        try { client.send(out); } catch { }
-      }
-      return;
     }
 
-    if (!channel) {
-      enqueue(msg);
+    if (parsed.event === 'get_current_fronts') {
+      safeSend(client, {
+        event: 'current_fronts',
+        fronts: Array.from(currentFronts.values()),
+      });
     }
   });
 
   client.on('close', () => {
-    teardownUpstream();
-    queue.length = 0;
-    try { client.removeAllListeners(); } catch { }
-    connections.delete(ctx);
-  });
-
-  client.on('error', () => {
-    teardownUpstream();
-    queue.length = 0;
-    teardownClient();
-    connections.delete(ctx);
+    for (const ctx of connections) {
+      if (ctx.client === client) connections.delete(ctx);
+    }
   });
 });
 
-// Handle server close
-server.on('close', () => {
-  connections.forEach(ctx => {
-    try { if (ctx.channel) ctx.channel.leave(); } catch { }
-    try { if (ctx.socket) ctx.socket.disconnect(() => { }); } catch { }
-    try { ctx.client.terminate(); } catch { }
-    try { ctx.queue.length = 0; } catch { }
-  });
-  connections.clear();
-});
+httpServer.listen(PORT);
 
-// ---------- Graceful shutdown ----------
-function shutdown() {
-  try { server.close(); } catch { }
+// =========================
+// Startup & shutdown
+// =========================
 
-  connections.forEach(ctx => {
-    try { if (ctx.channel) ctx.channel.leave(); } catch { }
-    try { if (ctx.socket) ctx.socket.disconnect(() => { }); } catch { }
-    try { ctx.client.close(); } catch { }
-    try { ctx.client.terminate(); } catch { }
-    try { ctx.queue.length = 0; } catch { }
-  });
+loadHistory();
+setupUpstream();
 
-  connections.clear();
-
-  setTimeout(() => { process.exit(0); }, 250);
-}
-
-process.on('SIGTERM', shutdown);
-process.on('SIGINT', shutdown);
+process.on('SIGTERM', () => process.exit(0));
+process.on('SIGINT', () => process.exit(0));
