@@ -156,20 +156,15 @@ function saveHistory(alterId, ts) {
 }
 
 function updateLastFronted(alterId, front) {
-  // Prefer time_end, but ONLY if it exists.
   const ts = front.time_end ?? front.time_start;
   if (!ts) return;
 
-  // If time_end exists, ignore time_start entirely.
   if (front.time_end) {
-    // If we already saved this exact time_end, skip.
     if (lastFronted.get(alterId) === front.time_end) return;
     lastFronted.set(alterId, front.time_end);
     return saveHistory(alterId, front.time_end);
   }
 
-  // Only reach here if NO time_end exists.
-  // Now we allow time_start updates.
   if (lastFronted.get(alterId) === front.time_start) return;
   lastFronted.set(alterId, front.time_start);
   saveHistory(alterId, front.time_start);
@@ -198,7 +193,7 @@ function sanitizeFront(f) {
 }
 
 // =========================
-// Fronting state machine
+// Fronting state machine //
 // =========================
 
 function handleFrontsSnapshot(fronts) {
@@ -220,11 +215,6 @@ function handleFrontUpdated(payload) {
   updateLastFronted(sanitized.alter.id, sanitized.front);
 }
 
-/*  
-===========================================================
-⭐ FIXED VERSION OF handleFrontingEnded
-===========================================================
-*/
 function handleFrontingEnded(payload) {
   const alterId = payload?.alter_id;
   if (!alterId) return;
@@ -294,57 +284,6 @@ function scheduleReconnect() {
 function setupUpstream() {
   upstreamSocket = makePhoenixSocket();
   upstreamChannel = upstreamSocket.channel(`system:${SYSTEM_ID}`, { token: API_KEY });
-
-  upstreamSocket.onMessage(msg => {
-    try {
-      if (Array.isArray(msg)) {
-        const [_, __, topic, event, payload] = msg;
-
-        if (topic === `system:${SYSTEM_ID}` && event === 'fronting_ended') {
-          const alterId = payload?.alter_id;
-          if (!alterId) return;
-
-          /*  
-          ===========================================================
-          ⭐ FIXED RAW-ARRAY fronting_ended HANDLER
-          ===========================================================
-          */
-          const time_end =
-            payload?.front?.time_end ||
-            payload?.time_end ||
-            new Date().toISOString();
-
-          updateLastFronted(alterId, { time_end });
-
-          emit('broadcast', {
-            type: 'last_fronted_update',
-            alter_id: alterId,
-            timestamp: time_end,
-          });
-        }
-
-        return;
-      }
-
-      const { topic, event, payload } = msg;
-      if (topic !== `system:${SYSTEM_ID}`) return;
-
-      if (event === 'phx_reply' && payload?.response?.fronts) {
-        const sanitizedFronts = payload.response.fronts
-          .map(sanitizeFront)
-          .filter(Boolean);
-
-        handleFrontsSnapshot(sanitizedFronts);
-
-        emit('broadcast', {
-          type: 'fronts_snapshot',
-          fronts: sanitizedFronts,
-        });
-
-        for (const f of sanitizedFronts) updateLastFronted(f.alter.id, f.front);
-      }
-    } catch { }
-  });
 
   upstreamChannel
     .join()
@@ -424,7 +363,9 @@ const connections = new Set();
 
 function safeSend(client, obj) {
   try {
-    client.send(JSON.stringify(obj));
+    const out = JSON.stringify(obj);
+    if (Buffer.byteLength(out) > MAX_MESSAGE_BYTES) return;
+    client.send(out);
   } catch { }
 }
 
@@ -447,7 +388,8 @@ on('broadcast', msg => {
 });
 
 server.on('connection', client => {
-  connections.add({ client });
+  const ctx = { client };
+  connections.add(ctx);
 
   const fronts = Array.from(currentFronts.values());
   safeSend(client, { event: 'fronts_snapshot', fronts });
@@ -472,9 +414,13 @@ server.on('connection', client => {
   });
 
   client.on('close', () => {
-    for (const ctx of connections) {
-      if (ctx.client === client) connections.delete(ctx);
-    }
+    connections.delete(ctx);
+  });
+
+  client.on('error', () => {
+    connections.delete(ctx);
+    try { client.close(); } catch {}
+    try { client.terminate(); } catch {}
   });
 });
 
