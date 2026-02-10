@@ -249,39 +249,49 @@ function handlePrimaryFront(payload) {
 
 let upstreamSocket = null;
 let upstreamChannel = null;
-let reconnectTimer = null;
+let upstreamConnecting = false; // 🔒 guard to ensure only one connection attempt
 
 function makePhoenixSocket() {
   const socket = new Socket('wss://api.octocon.app/api/socket', {
     params: { token: API_KEY },
     transport: WebSocket,
     heartbeatIntervalMs: 30000,
+    // Let Phoenix handle reconnects; we won't do our own timer-based reconnect
     reconnectAfterMs: tries => [1000, 2000, 5000, 10000][Math.min(tries, 3)],
   });
 
   socket.onOpen(() => {
     systemStatus.upstreamConnected = true;
+    log('UPSTREAM', 'Socket connected');
   });
 
   socket.onClose(() => {
     systemStatus.upstreamConnected = false;
     systemStatus.channelJoined = false;
-    scheduleReconnect();
+    log('UPSTREAM', 'Socket closed');
+    // Phoenix will handle reconnect; we do NOT call setupUpstream() again
   });
 
   socket.connect();
   return socket;
 }
 
-function scheduleReconnect() {
-  if (reconnectTimer) return;
-  reconnectTimer = setTimeout(() => {
-    reconnectTimer = null;
-    setupUpstream();
-  }, 2000);
-}
-
 function setupUpstream() {
+  if (upstreamConnecting) {
+    return;
+  }
+  upstreamConnecting = true;
+
+  // If an old socket exists, close it before creating a new one
+  if (upstreamSocket) {
+    try {
+      upstreamSocket.disconnect();
+    } catch {}
+    try {
+      upstreamSocket.close();
+    } catch {}
+  }
+
   upstreamSocket = makePhoenixSocket();
   upstreamChannel = upstreamSocket.channel(`system:${SYSTEM_ID}`, { token: API_KEY });
 
@@ -289,6 +299,8 @@ function setupUpstream() {
     .join()
     .receive('ok', resp => {
       systemStatus.channelJoined = true;
+      upstreamConnecting = false;
+      log('UPSTREAM', 'Channel joined');
 
       if (Array.isArray(resp?.alters)) {
         for (const a of resp.alters) {
@@ -314,8 +326,16 @@ function setupUpstream() {
         for (const f of frontsOnly) updateLastFronted(f.alter.id, f.front);
       }
     })
-    .receive('error', () => scheduleReconnect())
-    .receive('timeout', () => scheduleReconnect());
+    .receive('error', err => {
+      upstreamConnecting = false;
+      log('UPSTREAM', 'Channel join error', { err: String(err) });
+      // Phoenix will retry via socket reconnect; no manual reconnect here
+    })
+    .receive('timeout', () => {
+      upstreamConnecting = false;
+      log('UPSTREAM', 'Channel join timeout');
+      // Phoenix will retry via socket reconnect; no manual reconnect here
+    });
 
   upstreamChannel.on('fronting_started', p => forwardEvent('fronting_started', p));
   upstreamChannel.on('fronting_ended', p => forwardEvent('fronting_ended', p));
@@ -331,6 +351,30 @@ function setupUpstream() {
     emit('broadcast', { type: event, payload });
   }
 }
+
+// =========================
+// Upstream watchdog (safe for long silence)
+// =========================
+
+setInterval(() => {
+
+  // 1. Socket disconnected?
+  if (!systemStatus.upstreamConnected) {
+    log("WATCHDOG", "Socket disconnected — reconnecting");
+    setupUpstream();
+    return;
+  }
+
+  // 2. Channel not joined?
+  if (!systemStatus.channelJoined) {
+    log("WATCHDOG", "Channel not joined — reconnecting");
+    setupUpstream();
+    return;
+  }
+
+  // If both are true, everything is healthy — even if silent for hours
+
+}, 10_000); // check every 10 seconds
 
 // =========================
 // HTTP + WebSocket server
