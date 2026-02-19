@@ -210,23 +210,19 @@ function handleFrontingStarted(payload) {
   const f = payload?.front;
   if (!f) return;
   currentFronts.set(f.alter.id, f);
-  updateLastFronted(f.alter.id, f.front);
 }
 
 function handleFrontUpdated(payload) {
   const f = payload?.front;
   if (!f) return;
   currentFronts.set(f.alter.id, f);
-  updateLastFronted(f.alter.id, f.front);
 }
 
 function handleFrontingEnded(payload) {
   const alterId = payload?.alter_id;
   if (!alterId) return;
 
-  const sec = alterSecurity.get(alterId)?.security_level;
-  if (!sec || sec === 'private') return;
-
+  // Always remove from visible fronts
   currentFronts.delete(alterId);
 
   const time_end =
@@ -234,11 +230,10 @@ function handleFrontingEnded(payload) {
     payload?.time_end ||
     new Date().toISOString();
 
+  // Log history for ALL alters (including private)
   updateLastFronted(alterId, { time_end });
 
-  const sec2 = alterSecurity.get(alterId)?.security_level;
-  if (!sec2 || sec2 === 'private') return;
-
+  // Broadcast last_fronted_update for ALL alters
   emit('broadcast', {
     type: 'last_fronted_update',
     alter_id: alterId,
@@ -328,6 +323,14 @@ function setupUpstream() {
       }
 
       if (Array.isArray(resp?.fronts)) {
+        // Log history for ALL alters
+        for (const f of resp.fronts) {
+          if (f?.alter?.id && f.front) {
+            updateLastFronted(f.alter.id, f.front);
+          }
+        }
+
+        // Sanitize for visibility
         const frontsOnly = resp.fronts.map(sanitizeFront).filter(Boolean);
         handleFrontsSnapshot(frontsOnly);
 
@@ -335,8 +338,6 @@ function setupUpstream() {
           type: 'fronts_snapshot',
           fronts: frontsOnly,
         });
-
-        for (const f of frontsOnly) updateLastFronted(f.alter.id, f.front);
       }
     })
     .receive('error', err => {
@@ -352,42 +353,47 @@ function setupUpstream() {
   upstreamChannel.on('fronting_ended', p => forwardEvent('fronting_ended', p));
   upstreamChannel.on('front_updated', p => forwardEvent('front_updated', p));
   upstreamChannel.on('primary_front', p => forwardEvent('primary_front', p));
+}
 
-  function forwardEvent(event, payload) {
-    if (event === 'fronting_started' || event === 'front_updated') {
-      const sanitized = sanitizeFront(payload.front);
-      if (!sanitized) return;
+function forwardEvent(event, payload) {
+  if (event === 'fronting_started' || event === 'front_updated') {
+    const raw = payload?.front;
 
-      const safePayload = { ...payload, front: sanitized };
-
-      if (event === 'fronting_started') handleFrontingStarted(safePayload);
-      else handleFrontUpdated(safePayload);
-
-      emit('broadcast', { type: event, payload: safePayload });
-      return;
+    // Log history for ALL alters (including private)
+    if (raw?.alter?.id && raw.front) {
+      updateLastFronted(raw.alter.id, raw.front);
     }
 
-    if (event === 'fronting_ended') {
-      const alterId = payload?.alter_id;
-      if (!alterId) return;
-      const sec = alterSecurity.get(alterId)?.security_level;
-      if (!sec || sec === 'private') return;
+    // Sanitize for visibility
+    const sanitized = sanitizeFront(payload.front);
+    if (!sanitized) return;
 
-      handleFrontingEnded(payload);
-      emit('broadcast', { type: event, payload });
-      return;
-    }
+    const safePayload = { ...payload, front: sanitized };
 
-    if (event === 'primary_front') {
-      const alterId = payload?.alter_id;
-      if (!alterId) return;
-      const sec = alterSecurity.get(alterId)?.security_level;
-      if (!sec || sec === 'private') return;
+    if (event === 'fronting_started') handleFrontingStarted(safePayload);
+    else handleFrontUpdated(safePayload);
 
-      handlePrimaryFront(payload);
-      emit('broadcast', { type: event, payload });
-      return;
-    }
+    emit('broadcast', { type: event, payload: safePayload });
+    return;
+  }
+
+  if (event === 'fronting_ended') {
+    // Handler logs history for all + broadcasts update
+    handleFrontingEnded(payload);
+    emit('broadcast', { type: event, payload });
+    return;
+  }
+
+  if (event === 'primary_front') {
+    const alterId = payload?.alter_id;
+    if (!alterId) return;
+
+    const sec = alterSecurity.get(alterId)?.security_level;
+    if (!sec || sec === 'private') return;
+
+    handlePrimaryFront(payload);
+    emit('broadcast', { type: event, payload });
+    return;
   }
 }
 
@@ -476,16 +482,10 @@ server.on('connection', client => {
     try { parsed = JSON.parse(msg); } catch { return; }
 
     if (parsed.event === 'get_last_fronted_all') {
-      const filtered = {};
-      for (const [id, ts] of lastFronted.entries()) {
-        const sec = alterSecurity.get(id)?.security_level;
-        if (!sec || sec === 'private') continue;
-        filtered[id] = ts;
-      }
-
+      // Send full history, including private alters
       safeSend(client, {
         event: 'last_fronted_all',
-        history: filtered,
+        history: Object.fromEntries(lastFronted.entries()),
       });
     }
 
