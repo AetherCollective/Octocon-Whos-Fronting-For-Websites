@@ -178,11 +178,16 @@ function sanitizeFront(f) {
   if (!f?.alter?.id || !f.front) return null;
 
   const sec = alterSecurity.get(f.alter.id)?.security_level;
-  if (sec !== 'public') return null;
+  // Allow public, trusted_only, friends_only; block private and unknown
+  if (!sec || sec === 'private') return null;
 
   return {
     primary: !!f.primary,
-    alter: { id: f.alter.id, name: f.alter.name, color: f.alter.color },
+    alter: {
+      id: f.alter.id,
+      name: f.alter.name,
+      color: f.alter.color,
+    },
     front: {
       id: f.front.id,
       comment: f.front.comment,
@@ -193,7 +198,7 @@ function sanitizeFront(f) {
 }
 
 // =========================
-// Fronting state machine //
+// Fronting state machine
 // =========================
 
 function handleFrontsSnapshot(fronts) {
@@ -202,22 +207,25 @@ function handleFrontsSnapshot(fronts) {
 }
 
 function handleFrontingStarted(payload) {
-  const sanitized = sanitizeFront(payload.front);
-  if (!sanitized) return;
-  currentFronts.set(sanitized.alter.id, sanitized);
-  updateLastFronted(sanitized.alter.id, sanitized.front);
+  const f = payload?.front;
+  if (!f) return;
+  currentFronts.set(f.alter.id, f);
+  updateLastFronted(f.alter.id, f.front);
 }
 
 function handleFrontUpdated(payload) {
-  const sanitized = sanitizeFront(payload.front);
-  if (!sanitized) return;
-  currentFronts.set(sanitized.alter.id, sanitized);
-  updateLastFronted(sanitized.alter.id, sanitized.front);
+  const f = payload?.front;
+  if (!f) return;
+  currentFronts.set(f.alter.id, f);
+  updateLastFronted(f.alter.id, f.front);
 }
 
 function handleFrontingEnded(payload) {
   const alterId = payload?.alter_id;
   if (!alterId) return;
+
+  const sec = alterSecurity.get(alterId)?.security_level;
+  if (!sec || sec === 'private') return;
 
   currentFronts.delete(alterId);
 
@@ -227,6 +235,9 @@ function handleFrontingEnded(payload) {
     new Date().toISOString();
 
   updateLastFronted(alterId, { time_end });
+
+  const sec2 = alterSecurity.get(alterId)?.security_level;
+  if (!sec2 || sec2 === 'private') return;
 
   emit('broadcast', {
     type: 'last_fronted_update',
@@ -238,6 +249,10 @@ function handleFrontingEnded(payload) {
 function handlePrimaryFront(payload) {
   const alterId = payload?.alter_id;
   if (!alterId) return;
+
+  const sec = alterSecurity.get(alterId)?.security_level;
+  if (!sec || sec === 'private') return;
+
   for (const f of currentFronts.values()) f.primary = false;
   const entry = currentFronts.get(alterId);
   if (entry) entry.primary = true;
@@ -256,7 +271,6 @@ function makePhoenixSocket() {
     params: { token: API_KEY },
     transport: WebSocket,
     heartbeatIntervalMs: 30000,
-    // Let Phoenix handle reconnects; we won't do our own timer-based reconnect
     reconnectAfterMs: tries => [1000, 2000, 5000, 10000][Math.min(tries, 3)],
   });
 
@@ -269,7 +283,6 @@ function makePhoenixSocket() {
     systemStatus.upstreamConnected = false;
     systemStatus.channelJoined = false;
     log('UPSTREAM', 'Socket closed');
-    // Phoenix will handle reconnect; we do NOT call setupUpstream() again
   });
 
   socket.connect();
@@ -282,7 +295,6 @@ function setupUpstream() {
   }
   upstreamConnecting = true;
 
-  // If an old socket exists, close it before creating a new one
   if (upstreamSocket) {
     try {
       upstreamSocket.disconnect();
@@ -304,9 +316,10 @@ function setupUpstream() {
 
       if (Array.isArray(resp?.alters)) {
         for (const a of resp.alters) {
-          if (a?.id && a.security_level === 'public') {
+          // Cache all non-private alters
+          if (a?.id && a.security_level !== 'private') {
             alterSecurity.set(a.id, {
-              security_level: 'public',
+              security_level: a.security_level,
               name: a.name,
               color: a.color,
             });
@@ -329,12 +342,10 @@ function setupUpstream() {
     .receive('error', err => {
       upstreamConnecting = false;
       log('UPSTREAM', 'Channel join error', { err: String(err) });
-      // Phoenix will retry via socket reconnect; no manual reconnect here
     })
     .receive('timeout', () => {
       upstreamConnecting = false;
       log('UPSTREAM', 'Channel join timeout');
-      // Phoenix will retry via socket reconnect; no manual reconnect here
     });
 
   upstreamChannel.on('fronting_started', p => forwardEvent('fronting_started', p));
@@ -343,38 +354,60 @@ function setupUpstream() {
   upstreamChannel.on('primary_front', p => forwardEvent('primary_front', p));
 
   function forwardEvent(event, payload) {
-    if (event === 'fronting_started') handleFrontingStarted(payload);
-    else if (event === 'front_updated') handleFrontUpdated(payload);
-    else if (event === 'fronting_ended') handleFrontingEnded(payload);
-    else if (event === 'primary_front') handlePrimaryFront(payload);
+    if (event === 'fronting_started' || event === 'front_updated') {
+      const sanitized = sanitizeFront(payload.front);
+      if (!sanitized) return;
 
-    emit('broadcast', { type: event, payload });
+      const safePayload = { ...payload, front: sanitized };
+
+      if (event === 'fronting_started') handleFrontingStarted(safePayload);
+      else handleFrontUpdated(safePayload);
+
+      emit('broadcast', { type: event, payload: safePayload });
+      return;
+    }
+
+    if (event === 'fronting_ended') {
+      const alterId = payload?.alter_id;
+      if (!alterId) return;
+      const sec = alterSecurity.get(alterId)?.security_level;
+      if (!sec || sec === 'private') return;
+
+      handleFrontingEnded(payload);
+      emit('broadcast', { type: event, payload });
+      return;
+    }
+
+    if (event === 'primary_front') {
+      const alterId = payload?.alter_id;
+      if (!alterId) return;
+      const sec = alterSecurity.get(alterId)?.security_level;
+      if (!sec || sec === 'private') return;
+
+      handlePrimaryFront(payload);
+      emit('broadcast', { type: event, payload });
+      return;
+    }
   }
 }
 
 // =========================
-// Upstream watchdog (safe for long silence)
+// Upstream watchdog
 // =========================
 
 setInterval(() => {
-
-  // 1. Socket disconnected?
   if (!systemStatus.upstreamConnected) {
-    log("WATCHDOG", "Socket disconnected — reconnecting");
+    log('WATCHDOG', 'Socket disconnected — reconnecting');
     setupUpstream();
     return;
   }
 
-  // 2. Channel not joined?
   if (!systemStatus.channelJoined) {
-    log("WATCHDOG", "Channel not joined — reconnecting");
+    log('WATCHDOG', 'Channel not joined — reconnecting');
     setupUpstream();
     return;
   }
-
-  // If both are true, everything is healthy — even if silent for hours
-
-}, 10_000); // check every 10 seconds
+}, 10_000);
 
 // =========================
 // HTTP + WebSocket server
@@ -410,7 +443,7 @@ function safeSend(client, obj) {
     const out = JSON.stringify(obj);
     if (Buffer.byteLength(out) > MAX_MESSAGE_BYTES) return;
     client.send(out);
-  } catch { }
+  } catch {}
 }
 
 on('broadcast', msg => {
@@ -443,9 +476,16 @@ server.on('connection', client => {
     try { parsed = JSON.parse(msg); } catch { return; }
 
     if (parsed.event === 'get_last_fronted_all') {
+      const filtered = {};
+      for (const [id, ts] of lastFronted.entries()) {
+        const sec = alterSecurity.get(id)?.security_level;
+        if (!sec || sec === 'private') continue;
+        filtered[id] = ts;
+      }
+
       safeSend(client, {
         event: 'last_fronted_all',
-        history: Object.fromEntries(lastFronted.entries()),
+        history: filtered,
       });
     }
 
