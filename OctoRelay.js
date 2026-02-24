@@ -293,10 +293,10 @@ function setupUpstream() {
   if (upstreamSocket) {
     try {
       upstreamSocket.disconnect();
-    } catch {}
+    } catch { }
     try {
       upstreamSocket.close();
-    } catch {}
+    } catch { }
   }
 
   upstreamSocket = makePhoenixSocket();
@@ -353,6 +353,19 @@ function setupUpstream() {
   upstreamChannel.on('fronting_ended', p => forwardEvent('fronting_ended', p));
   upstreamChannel.on('front_updated', p => forwardEvent('front_updated', p));
   upstreamChannel.on('primary_front', p => forwardEvent('primary_front', p));
+
+  // --- Channel death detection (critical) ---
+  upstreamChannel.onClose(() => {
+    log('UPSTREAM', 'Channel closed — forcing reconnect');
+    systemStatus.channelJoined = false;
+    setupUpstream();
+  });
+
+  upstreamChannel.onError(err => {
+    log('UPSTREAM', 'Channel error — forcing reconnect', { err: String(err) });
+    systemStatus.channelJoined = false;
+    setupUpstream();
+  });
 }
 
 function forwardEvent(event, payload) {
@@ -449,7 +462,7 @@ function safeSend(client, obj) {
     const out = JSON.stringify(obj);
     if (Buffer.byteLength(out) > MAX_MESSAGE_BYTES) return;
     client.send(out);
-  } catch {}
+  } catch { }
 }
 
 on('broadcast', msg => {
@@ -503,8 +516,8 @@ server.on('connection', client => {
 
   client.on('error', () => {
     connections.delete(ctx);
-    try { client.close(); } catch {}
-    try { client.terminate(); } catch {}
+    try { client.close(); } catch { }
+    try { client.terminate(); } catch { }
   });
 });
 
