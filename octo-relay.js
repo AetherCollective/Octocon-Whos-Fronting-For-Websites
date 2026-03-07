@@ -13,8 +13,7 @@
 const { Socket } = require('phoenix');
 const WebSocket = require('ws');
 const http = require('http');
-const fs = require('fs');
-const path = require('path');
+const { Redis } = require('@upstash/redis');
 
 // =========================
 // Environment & constants
@@ -30,7 +29,6 @@ if (!API_KEY || !SYSTEM_ID) {
 }
 
 const PORT = 3000;
-const HISTORY_FILE = path.join(__dirname, 'data', 'history.json');
 const MAX_ALTERS = 1000;
 const MAX_MESSAGE_BYTES = 512 * 1024;
 
@@ -118,13 +116,24 @@ class LRUMap {
   }
 }
 
-// =========================
-// State store
-// =========================
-
 const lastFronted = new Map();
 const currentFronts = new Map();
 const alterSecurity = new LRUMap(MAX_ALTERS);
+
+// =========================
+// Upstash Redis client
+// =========================
+
+const redis = new Redis({
+  url: process.env.UPSTASH_REDIS_REST_URL,
+  token: process.env.UPSTASH_REDIS_REST_TOKEN,
+});
+
+const REDIS_KEY = 'octo:lastFronted';
+
+// =========================
+// State store
+// =========================
 
 const systemStatus = {
   upstreamConnected: false,
@@ -135,42 +144,43 @@ const systemStatus = {
 // History persistence
 // =========================
 
-function loadHistory() {
+async function loadHistory() {
   try {
-    const raw = fs.readFileSync(HISTORY_FILE, 'utf8');
-    const obj = JSON.parse(raw);
-    for (const [id, ts] of Object.entries(obj)) {
-      if (typeof ts === 'string') lastFronted.set(id, ts);
+    const obj = await redis.hgetall(REDIS_KEY);
+    if (obj) {
+      for (const [id, ts] of Object.entries(obj)) {
+        if (typeof ts === 'string') lastFronted.set(id, ts);
+      }
     }
-    log('HISTORY', `Loaded ${lastFronted.size} entries`);
+    log('HISTORY', `Loaded ${lastFronted.size} entries from Redis`);
   } catch (e) {
-    log('HISTORY', 'No history file found or failed to parse, starting fresh', { error: String(e) });
+    log('HISTORY', 'Failed to load history from Redis, starting fresh', { error: String(e) });
   }
 }
 
-function saveHistory(alterId, ts) {
-  const obj = Object.fromEntries(lastFronted.entries());
+async function saveHistory(alterId, ts) {
   try {
-    fs.writeFileSync(HISTORY_FILE, JSON.stringify(obj, null, 2), 'utf8');
-    log('HISTORY', `Saved ${Object.keys(obj).length} entries`, { alterId, ts });
+    await redis.hset(REDIS_KEY, { [alterId]: ts });
+    log('HISTORY', `Saved entry to Redis`, { alterId, ts });
   } catch (e) {
-    log('ERROR', 'Failed to write history file', { error: String(e) });
+    log('ERROR', 'Failed to save history to Redis', { error: String(e) });
   }
 }
 
-function updateLastFronted(alterId, front) {
+async function updateLastFronted(alterId, front) {
   const ts = front.time_end ?? front.time_start;
   if (!ts) return;
 
   if (front.time_end) {
     if (lastFronted.get(alterId) === front.time_end) return;
     lastFronted.set(alterId, front.time_end);
-    return saveHistory(alterId, front.time_end);
+    await saveHistory(alterId, front.time_end);
+    return;
   }
 
   if (lastFronted.get(alterId) === front.time_start) return;
   lastFronted.set(alterId, front.time_start);
-  saveHistory(alterId, front.time_start);
+  await saveHistory(alterId, front.time_start);
 }
 
 // =========================
@@ -596,8 +606,7 @@ httpServer.listen(PORT);
 // Startup & shutdown
 // =========================
 
-loadHistory();
-setupUpstream();
+loadHistory().then(() => setupUpstream());
 
 process.on('SIGTERM', () => process.exit(0));
 process.on('SIGINT',  () => process.exit(0));

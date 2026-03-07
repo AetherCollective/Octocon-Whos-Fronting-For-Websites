@@ -2,14 +2,15 @@
   "name": "octo-relay",
   "version": "1.0.0",
   "description": "Octocon Relay Server",
-  "main": "octo-relay.js",
+  "main": "OctoRelay.js",
   "scripts": {
-    "start": "node octo-relay.js"
+    "start": "node OctoRelay.js"
   },
   "dependencies": {
     "ws": "^8.16.0",
     "phoenix": "^1.7.0",
-    "dotenv": "^16.4.0"
+    "dotenv": "^16.4.0",
+    "@upstash/redis": "^1.34.0"
   },
   "engines": {
     "node": ">=18 <22"
