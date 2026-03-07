@@ -3,243 +3,42 @@
   <p id="text02" class="text-component instance-2 style-1"><span class="p"><strong>Currently Fronting:</strong>
       Checking...</span></p>
 </div>
-<script>
-  const relay = "YOUR_RELAY_IP_HERE";
-  const elementID = "text02";
-
-  let ws = null;
-  let currentFronts = [];
-  let primaryAlterId = null;
-  let lastFrontedHistory = {};
-  let historyLoaded = false;
-
-  // Dynamic registry for last-fronted elements
-  const lastFrontedTargets = [];
-
-  // Optional explicit registration (still available if you want it)
-  function registerLastFrontedTarget(alterId, elementId) {
-    const key = String(alterId);
-    if (!lastFrontedTargets.some(t => t.alterId === key && t.elementId === elementId)) {
-      lastFrontedTargets.push({ alterId: key, elementId });
-    }
-  }
-
-  function updateElement(el, html) {
-    if (el.dataset.lastValue !== html) {
-      el.dataset.lastValue = html;
-      el.innerHTML = html;
-    }
-  }
-
-  function connect() {
-    ws = new WebSocket("wss://" + relay);
-
-    ws.onopen = () => {
-      ws.send(JSON.stringify({ event: "get_last_fronted_all" }));
-      ws.send(JSON.stringify({ event: "get_current_fronts" }));
-    };
-
-    ws.onmessage = event => {
-      let msg;
-      try { msg = JSON.parse(event.data); } catch { return; }
-
-      if (Array.isArray(msg)) {
-        currentFronts = msg;
-        primaryAlterId = currentFronts.find(f => f.primary)?.alter?.id ?? null;
-        updateFronts();
-        return;
+<p id="text02" class="text-component instance-2 style-1"><span class="p"><strong>Currently Fronting:</strong>
+    <script src="octo-client.js" />
+    <script>
+      document.addEventListener('DOMContentLoaded', () => {
+        getCurrentFronters('text02');
+        getLastFrontedDateTime('text03', '6');
+      });
+    </script>
+    <style>
+      rainbow {
+        color: transparent;
+        letter-spacing: 0.05em;
+        background: linear-gradient(45deg, #fd004c 16.7%, #fe9000 16.7%, #fe9000 33.4%, #fff020 33.4%, #fff020 50.1%, #3edf4b 50.1%, #3edf4b 66.8%, #6c8fff 66.8%, #6c8fff 83.5%, #d112d8 83.5%);
+        -webkit-text-stroke: 0.02em black;
+        -webkit-background-clip: text;
+        background-clip: text;
+        animation: rainbow 50s linear infinite, pulse 0.8s infinite ease-in-out alternate;
       }
 
-      switch (msg.event) {
-        case "fronts_snapshot":
-          currentFronts = msg.fronts || [];
-          primaryAlterId = currentFronts.find(f => f.primary)?.alter?.id ?? null;
-          updateFronts();
-          break;
-
-        case "fronting_started":
-          if (msg.payload?.front) {
-            currentFronts.push(msg.payload.front);
-            updateFronts();
-          }
-          break;
-
-        case "fronting_ended":
-          if (msg.payload?.alter_id) {
-            const endedId = msg.payload.alter_id;
-            currentFronts = currentFronts.filter(f => f.alter.id !== endedId);
-            updateFronts();
-            // ❗ no local timestamp here anymore – relay sends last_fronted_update
-          }
-          break;
-
-        case "front_updated":
-          if (msg.payload?.front) {
-            currentFronts = currentFronts.map(f =>
-              f.alter.id === msg.payload.front.alter.id
-                ? msg.payload.front
-                : f
-            );
-            updateFronts();
-          }
-          break;
-
-        case "current_fronts":
-          currentFronts = msg.fronts || [];
-          primaryAlterId = currentFronts.find(f => f.primary)?.alter?.id ?? null;
-          updateFronts();
-          break;
-
-        case "primary_front":
-          primaryAlterId = msg.payload?.alter_id ?? null;
-          updateFronts();
-          break;
-
-        case "last_fronted_all":
-          lastFrontedHistory = msg.history || {};
-          historyLoaded = true;
-          break;
-
-        case "last_fronted_update":
-          if (msg.alter_id && msg.timestamp) {
-            const key = String(msg.alter_id);
-            lastFrontedHistory[key] = msg.timestamp;
-          }
-          break;
+      @keyframes rainbow {
+        100% {
+          background-position: 400em -50em;
+        }
       }
-    };
 
-    ws.onclose = () => setTimeout(connect, 3000);
-  }
+      pulse {
+        animation: pulse 2s infinite ease-in-out alternate;
+      }
 
-  // 🔥 This is what your client calls
-  function GetLastFrontedDateTime(alterId, elementId) {
-    const key = String(alterId);
-
-    // ⭐ Auto-register this target for future refreshes
-    if (!lastFrontedTargets.some(t => t.alterId === key && t.elementId === elementId)) {
-      lastFrontedTargets.push({ alterId: key, elementId });
-    }
-
-    if (!historyLoaded) return;
-
-    const el = document.getElementById(elementId);
-    if (!el) return;
-
-    const ts = lastFrontedHistory[key];
-
-    const isFronting = currentFronts.some(f => f.alter?.id == alterId);
-    if (isFronting) {
-      updateElement(el, `
-<span class="p"><strong>Last Fronted:&nbsp;
-<rainbow class="pulse">Actively Fronting Now!</rainbow></strong></span>
-`);
-      return;
-    }
-
-    if (!ts) {
-      updateElement(el, `<span class="p"><strong>Last Fronted:</strong> Unknown</span>`);
-      return;
-    }
-
-    const now = Date.now();
-    const then = new Date(ts).getTime();
-    const diffMs = now - then;
-
-    if (diffMs < 0) {
-      updateElement(el, `<span class="p"><strong>Last Fronted:</strong> In the future?</span>`);
-      return;
-    }
-
-    const seconds = Math.floor(diffMs / 1000);
-    const minutes = Math.floor(seconds / 60);
-    const hours = Math.floor(minutes / 60);
-    const days = Math.floor(hours / 24);
-    const months = Math.floor(days / 30.4375);
-    const years = Math.floor(months / 12);
-
-    const plural = (v, w) => `${v} ${w}${v === 1 ? "" : "s"}`;
-    let parts = [];
-
-    if (years > 0) {
-      parts.push(plural(years, "year"));
-      const remMonths = months % 12;
-      if (remMonths > 0) parts.push(plural(remMonths, "month"));
-    } else if (months > 0) {
-      parts.push(plural(months, "month"));
-      const remDays = Math.floor(days % 30.4375);
-      if (remDays > 0) parts.push(plural(remDays, "day"));
-    } else if (days > 0) {
-      parts.push(plural(days, "day"));
-      const remHours = hours % 24;
-      if (remHours > 0) parts.push(plural(remHours, "hour"));
-    } else if (hours > 0) {
-      parts.push(plural(hours, "hour"));
-      const remMinutes = minutes % 60;
-      if (remMinutes > 0) parts.push(plural(remMinutes, "minute"));
-    } else if (minutes > 0) {
-      parts.push(plural(minutes, "minute"));
-      const remSeconds = seconds % 60;
-      if (remSeconds > 0) parts.push(plural(remSeconds, "second"));
-    } else {
-      parts.push(plural(seconds, "second"));
-    }
-
-    const relative = parts.slice(0, 2).join(", ");
-    updateElement(el, `<span class="p"><strong>Last Fronted:</strong> ${relative} ago</span>`);
-  }
-
-  function updateFronts() {
-    const container = document.getElementById(frontsContainerId);
-    if (!container) return;
-
-    const visible = currentFronts.filter(
-      f => f.alter?.security_level !== "private"
-    );
-
-    if (!visible.length) {
-      container.innerHTML = "<strong>No one is currently fronting.</strong>";
-      return;
-    }
-
-    let ordered = [...visible];
-    if (primaryAlterId) {
-      ordered.sort((a, b) =>
-        a.alter.id === primaryAlterId ? -1 :
-          b.alter.id === primaryAlterId ? 1 : 0
-      );
-    }
-
-    const members = ordered
-      .map(f => {
-        const a = f.alter;
-        if (!a) return null;
-
-        const safe = a.name.replace(/\s+/g, "-");
-        let name = `<a href="#${safe}" style="color:${a.color};">${a.name}</a>`;
-
-        if (f.front?.comment?.trim()) {
-          name += ` <span style="color:${a.color};">(${f.front.comment})</span>`;
+      @keyframes pulse {
+        from {
+          transform: scale(0.975);
         }
 
-        if (a.id === primaryAlterId) {
-          name = `<strong>${name}</strong>`;
+        to {
+          transform: scale(1.025);
         }
-
-        return name;
-      })
-      .filter(Boolean);
-
-    container.innerHTML = `<strong>Currently Fronting:</strong> ${members.join(", ")}`;
-  }
-
-  connect();
-
-  // Refresh all registered targets every second
-  setInterval(() => {
-    if (!historyLoaded) return;
-    for (const t of lastFrontedTargets) {
-      GetLastFrontedDateTime(t.alterId, t.elementId);
-    }
-  }, 1000);
-</script>
+      }
+    </style>
