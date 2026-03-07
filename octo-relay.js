@@ -129,6 +129,9 @@ const redis = new Redis({
   token: process.env.UPSTASH_REDIS_REST_TOKEN,
 });
 
+console.log('REDIS URL:', process.env.UPSTASH_REDIS_REST_URL ? 'SET' : 'MISSING');
+console.log('REDIS TOKEN:', process.env.UPSTASH_REDIS_REST_TOKEN ? 'SET' : 'MISSING');
+
 const REDIS_KEY = 'octo:lastFronted';
 
 // =========================
@@ -147,9 +150,10 @@ const systemStatus = {
 async function loadHistory() {
   try {
     const obj = await redis.hgetall(REDIS_KEY);
+    console.log('RAW REDIS RESPONSE:', JSON.stringify(obj));
     if (obj) {
       for (const [id, ts] of Object.entries(obj)) {
-        if (typeof ts === 'string') lastFronted.set(id, ts);
+        if (ts != null) lastFronted.set(String(id), String(ts));
       }
     }
     log('HISTORY', `Loaded ${lastFronted.size} entries from Redis`);
@@ -231,7 +235,7 @@ function handleFrontUpdated(payload) {
   currentFronts.set(f.alter.id, f);
 }
 
-function handleFrontingEnded(payload) {
+async function handleFrontingEnded(payload) {
   const alterId = payload?.alter_id;
   if (!alterId) return;
 
@@ -242,7 +246,7 @@ function handleFrontingEnded(payload) {
     payload?.time_end ||
     new Date().toISOString();
 
-  updateLastFronted(alterId, { time_end });
+  await updateLastFronted(alterId, { time_end });
 
   emit('broadcast', {
     type: 'last_fronted_update',
@@ -443,12 +447,12 @@ function setupUpstream() {
 // Forward upstream events
 // =========================
 
-function forwardEvent(event, payload) {
+async function forwardEvent(event, payload) {
   if (event === 'fronting_started' || event === 'front_updated') {
     const raw = payload?.front;
 
     if (raw?.alter?.id && raw.front) {
-      updateLastFronted(raw.alter.id, raw.front);
+      await updateLastFronted(raw.alter.id, raw.front);
     }
 
     const sanitized = sanitizeFront(payload.front);
@@ -464,7 +468,7 @@ function forwardEvent(event, payload) {
   }
 
   if (event === 'fronting_ended') {
-    handleFrontingEnded(payload);
+    await handleFrontingEnded(payload);
     emit('broadcast', { type: event, payload });
     return;
   }
