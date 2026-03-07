@@ -8,6 +8,7 @@
   },
   "dependencies": {
     "ws": "^8.16.0",
+    "phoenix": "^1.7.0",
     "dotenv": "^16.4.0"
   },
   "engines": {
