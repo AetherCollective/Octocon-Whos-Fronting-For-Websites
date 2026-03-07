@@ -129,8 +129,6 @@ const redis = new Redis({
   token: process.env.UPSTASH_REDIS_REST_TOKEN,
 });
 
-console.log('REDIS URL:', process.env.UPSTASH_REDIS_REST_URL ? 'SET' : 'MISSING');
-console.log('REDIS TOKEN:', process.env.UPSTASH_REDIS_REST_TOKEN ? 'SET' : 'MISSING');
 
 const REDIS_KEY = 'octo:lastFronted';
 
@@ -150,7 +148,6 @@ const systemStatus = {
 async function loadHistory() {
   try {
     const obj = await redis.hgetall(REDIS_KEY);
-    console.log('RAW REDIS RESPONSE:', JSON.stringify(obj));
     if (obj) {
       for (const [id, ts] of Object.entries(obj)) {
         if (ts != null) lastFronted.set(String(id), String(ts));
