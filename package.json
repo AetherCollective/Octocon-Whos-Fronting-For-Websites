@@ -4,7 +4,7 @@
   "description": "Octocon Relay Server",
   "main": "OctoRelay.js",
   "scripts": {
-    "start": "node OctoRelay.js"
+    "start": "node octo-relay.js"
   },
   "dependencies": {
     "ws": "^8.16.0",
